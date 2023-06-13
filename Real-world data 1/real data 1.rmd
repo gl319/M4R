@@ -194,7 +194,7 @@ y_oe1 <- proc(y_ref1, t(matrix(dec_oe1$ys, c(d, n*l))))$Yhat
 ```
 
 ```{r}
-# compute RI
+# compute RI and record all group assignments
 cr_iuase <- array(NA, c(n, l))
 cr_cuase <- array(NA, c(n, l))
 cr_sase <- array(NA, c(n, l))
