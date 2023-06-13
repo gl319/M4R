@@ -672,7 +672,7 @@ legend(x="bottomright", legend=c("SASE", "IUASE", "CUASE", "OE"),
 ```
 
 ```{r}
-# find time for max and min ri 
+# find the time for max and min ri 
 max_ri1 <- which.max(ri_iuase1+ri_cuase1+ri_sase1+ri_oe1)
 min_ri1 <- which.min(ri_iuase1+ri_cuase1+ri_sase1+ri_oe1)
 max_ri <- which.max(ri_iuase+ri_cuase+ri_sase+ri_oe)
