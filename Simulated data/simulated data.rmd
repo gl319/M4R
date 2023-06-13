@@ -1,0 +1,755 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, echo=FALSE}
+# load needed packages
+library(MASS)
+library(smacof)
+library(cluster)
+library(fossil)
+library(latex2exp)
+```
+
+```{r}
+# time points for simulation
+ts <- 1 
+tps <- seq(1, 50, by=ts) 
+l <- length(tps) 
+
+# no. of nodes, dimensions and clusters
+n <- 50
+d <- 4 
+L <- 3 
+
+# parameters for kernel function
+alpha1 <- 2
+ro1 <- 8
+paras1 <- c(alpha1, ro1)
+alpha2 <- 0.25
+ro2 <- 4
+paras2 <- c(alpha2, ro2)
+
+# no. of simulations
+nsims <- c(1, as.vector(t(sapply(2:10, function(x) x * 10^(0:3)))))
+lnsims <- length(nsims)
+```
+
+```{r}
+# squared exponential kernel function
+k_sqexp <- function(t1, t2, paras){
+  alpha <- paras[1]
+  ro <- paras[2]
+  alpha^2 * exp(-0.5 * abs(t1-t2)^2 / ro^2)
+}
+
+# extract positive part of a vector
+f2 <- function(x){
+  pmax(x, 0)
+}
+
+# generate mean of gaussian process according to cluster
+gen_mu <- function(tps, d, paras, m, k){
+  l <- length(tps)
+  K <- matrix(NA, l, l)
+  for (i in 1:l){
+    for (j in 1:l){
+      K[i, j] <- k(tps[i], tps[j], paras)
+    }
+  }
+  mvrnorm(d, rep(m, l), K)
+}
+
+# generate latent positions of each node 
+gen_x <- function(tps, paras, m, f, k){
+  l <- length(tps)
+  d <- dim(m)[1]
+  K <- matrix(NA, l, l)
+  x <- matrix(NA, d, l)
+  for (i in 1:l){
+    for (j in 1:l){
+      K[i, j] <- k(tps[i], tps[j], paras)
+    }
+  }
+  for (i in 1:d){
+    x[i,] <- f(mvrnorm(1, m[i,], K))
+  }
+  x
+}
+
+# generate SOC between each pair of nodes
+gen_lambda <- function(tps, paras, mus, grps, f, k){
+  ts <- tps[2] - tps[1]
+  n <- length(grps)
+  l <- length(tps)
+  d <- dim(mus)[1]
+  lambda <- array(NA, c(n, n, l))
+  x <- f(mvrnorm(d, rep(1, n), 0.16*diag(n)))
+  ys <- array(NA, c(d, l, n))
+  for (i in 1:n){
+    ys[,,i] <- gen_x(tps, paras, mus[,,grps[i]], f, k)
+  }
+  ys <- aperm(ys, c(1, 3, 2))
+  for (i in 1:l){
+    y <- ys[,,i]
+    lambda[,,i] <- t(x) %*% y
+  }
+  list(x=x, y=t(matrix(ys, c(d, n*l))), ys=ys, lambda=lambda)
+}
+
+# simulate poisson process
+sim_pois <- function(tps, n, lambda){
+  ts <- tps[2] - tps[1]
+  l <- length(tps)
+  Ai <- array(NA, c(n, n, l))
+  Ac <- array(NA, c(n, n, l))
+  Ai[,,1] <- matrix(rpois(n^2, lambda[,,1]*ts), nrow=n, byrow=FALSE)
+  Ac[,,1] <- Ai[,,1]
+  for (i in 2:l){
+    Ai[,,i] <- matrix(rpois(n^2, lambda[,,i]*ts), nrow=n, byrow=FALSE)
+    Ac[,,i] <- Ac[,,i-1] + Ai[,,i]
+  }
+  list(Ai=Ai, Ac=Ac)
+}
+
+# IUASE
+decompose <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  A <- matrix(A_arr, n, n*l)
+  udv <- svd(A, nd, nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  ys <- array(t(y), c(nd, n, l))
+  Ah <- x %*% t(y)
+  Ash <- array(Ah, c(n, n, l))
+  list(x=x, y=y, ys=ys, Ash=Ash)
+}
+
+# ASE
+decompose_ase <- function(A, nd){
+  n <- dim(A)[1]
+  udv <- svd(A, nd, nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  Ah <- x %*% t(y)
+  list(x=x, y=y, Ah=Ah)
+}
+
+# SASE
+decompose_sase <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  x <- array(NA, c(n, nd, l))
+  y <- array(NA, c(n, nd, l))
+  Ash <- array(NA, c(n, n, l))
+  for (i in 1:l) {
+    A <- A_arr[,,i]
+    xyi <- decompose_ase(A, nd)
+    x[,,i] <- xyi$x
+    y[,,i] <- xyi$y
+    Ash[,,i] <- xyi$Ah
+  }
+  xs <- aperm(x, c(2, 1, 3))
+  ys <- aperm(y, c(2, 1, 3))
+  list(xs=xs, ys=ys, Ash=Ash)
+}
+
+# OE
+decompose_omnibus <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  A <- matrix(NA, n*l, n*l)
+  for (i in 1:l){
+    for (j in 1:l){
+      A[(n*(i-1)+1):(n*i), (n*(j-1)+1):(n*j)] <- (A_arr[,,i]+A_arr[,,j]) / 2
+    }
+  }
+  udv <- svd(A, nd, nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  xs <- array(t(x), c(nd, n, l))
+  ys <- array(t(y), c(nd, n, l))
+  Ash <- array(NA, c(n, n, l))
+  for (i in 1:l) {
+    Ash[,,i] <- x[((n*(i-1)+1):(n*i)),] %*% 
+      t(y[((n*(i-1)+1):(n*i)),])
+  }
+  list(xs=xs, ys=ys, Ash=Ash)
+}
+
+# approximate derivatives 
+dif <- function(dx, y){
+  d <- dim(y)[1]
+  n <- dim(y)[2]
+  l <- dim(y)[3]
+  yp <- array(NA, c(d, n, l))
+  yp[,,1] <- y[,,1] / dx
+  for (i in 2:l){
+    yp[,,i] <- (y[,,i]-y[,,(i-1)]) / dx
+  }
+  yp
+}
+
+# mean squared errors
+mse <- function(lambdas, lambdahs){
+  mean((lambdas - lambdahs)^2)
+}
+
+# procrustes transformation
+proc <- function(X, Y){
+  p <- Procrustes(X, Y)
+  rt <- p$rotation
+  dl <- p$dilation
+  list(rt=rt, dl=dl, Yhat=dl * Y %*% rt)
+}
+```
+
+```{r}
+# generate SOC for all pairs of nodes and all time points
+set.seed(321)
+grps <- sample(1:L, n, TRUE, rep(1/L, L))
+mus <- array(NA, c(d, l, L))
+for (i in 1:L) {
+  mus[,,i] <- gen_mu(tps, d, paras1, 4, k_sqexp)
+}
+gen <- gen_lambda(tps, paras2, mus, grps, f2, k_sqexp)
+lambda <- gen$lambda
+x <- gen$x
+y <- gen$y
+ys <- gen$ys
+```
+
+```{r}
+# initiate all stats
+lambda_iuase <- array(NA, c(n, n, l, lnsims))
+lambda_cuase <- array(NA, c(n, n, l, lnsims))
+lambda_crude <- array(NA, c(n, n, l, lnsims))
+lambda_sase <- array(NA, c(n, n, l, lnsims))
+lambda_oe <- array(NA, c(n, n, l, lnsims))
+lambda_iuasep <- array(NA, c(n, n, l, lnsims))
+lambda_cuasep <- array(NA, c(n, n, l, lnsims))
+
+lmse_iuase <- rep(NA, lnsims)
+lmse_cuase <- rep(NA, lnsims)
+lmse_crude <- rep(NA, lnsims)
+lmse_sase <- rep(NA, lnsims)
+lmse_oe <- rep(NA, lnsims)
+lmse_iuasep <- rep(NA, lnsims)
+lmse_cuasep <- rep(NA, lnsims)
+
+ymse_iuase <- rep(NA, lnsims)
+ymse_cuase <- rep(NA, lnsims)
+ymse_sase <- rep(NA, lnsims)
+ymse_oe <- rep(NA, lnsims)
+
+cr_iuase <- array(NA, c(n, l, lnsims))
+cr_cuase <- array(NA, c(n, l, lnsims))
+cr_sase <- array(NA, c(n, l, lnsims))
+cr_oe <- array(NA, c(n, l, lnsims))
+
+mri_iuase <- rep(NA, lnsims)
+mri_cuase <- rep(NA, lnsims)
+mri_sase <- rep(NA, lnsims)
+mri_oe <- rep(NA, lnsims)
+```
+
+```{r, warning=FALSE}
+# analysis on one sample
+set.seed(321)
+
+# run one simulation
+simulation1 <- sim_pois(tps, n, lambda)
+Ai1 <- simulation1$Ai 
+Ac1 <- simulation1$Ac 
+  
+# decompose to obtain x and y tilde and s hat
+dec_iuase1 <- decompose(Ai1, d)
+dec_cuase1 <- decompose(Ac1, d)
+dec_sase1 <- decompose_sase(Ai1, d)
+dec_oe1 <- decompose_omnibus(Ai1, d)
+dec_iuasep1 <- decompose(Ai1, d-1)
+dec_cuasep1 <- decompose(Ac1, d-1)
+
+Ah_iuase1 <- dec_iuase1$Ash 
+Ah_cuase1 <- dec_cuase1$Ash 
+Ah_sase1 <- dec_sase1$Ash 
+Ah_oe1 <- dec_oe1$Ash 
+Ah_iuasep1 <- dec_iuasep1$Ash 
+Ah_cuasep1 <- dec_cuasep1$Ash 
+  
+lambda_iuase[,,,1] <- Ah_iuase1 / ts
+lambda_cuase[,,,1] <- dif(ts, Ah_cuase1) 
+lambda_crude[,,,1] <- Ai1 / ts
+lambda_sase[,,,1] <- Ah_sase1 / ts
+lambda_oe[,,,1] <- Ah_oe1 / ts
+lambda_iuasep[,,,1] <- Ah_iuasep1 / ts
+lambda_cuasep[,,,1] <- dif(ts, Ah_cuasep1) 
+  
+lmse_iuase[1] <- mse(lambda, lambda_iuase[,,,1])
+lmse_cuase[1] <- mse(lambda, lambda_cuase[,,,1])
+lmse_crude[1] <- mse(lambda, lambda_crude[,,,1])
+lmse_sase[1] <- mse(lambda, lambda_sase[,,,1])
+lmse_oe[1] <- mse(lambda, lambda_oe[,,,1])
+lmse_iuasep[1] <- mse(lambda, lambda_iuasep[,,,1])
+lmse_cuasep[1] <- mse(lambda, lambda_cuasep[,,,1])
+
+# procrustes transformation to obtain y hat
+y_iuase1 <- proc(y, dec_iuase1$y)$Yhat
+y_cuase1 <- proc(y, t(matrix(dif(ts, dec_cuase1$ys), c(d, n*l))))$Yhat
+x_sase1 <- dec_sase1$xs
+y_sase1 <- array(NA, c(d, n, l))
+for (j in 1:l){
+  p <- proc(t(x), t(x_sase1[,,j]))
+  rt <- p$rt
+  dl <- p$dl
+  y_sase1[,,j] <- t(rt) %*% dec_sase1$ys[,,j] / dl
+}
+y_sase1 <- t(matrix(y_sase1, c(d, n*l)))
+y_oe1 <- proc(y, t(matrix(dec_oe1$ys, c(d, n*l))))$Yhat
+  
+ymse_iuase[1] <- mse(y, y_iuase1)
+ymse_cuase[1] <- mse(y, y_cuase1)
+ymse_sase[1] <- mse(y, y_sase1)
+ymse_oe[1] <- mse(y, y_oe1)
+
+# compute RI
+ri_iuase1 <- rep(NA, l)
+ri_cuase1 <- rep(NA, l)
+ri_sase1 <- rep(NA, l)
+ri_oe1 <- rep(NA, l)
+
+for (j in 1:l){
+  cr_i <- kmeans(y_iuase1[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+  cr_c <- kmeans(y_cuase1[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+  cr_s <- kmeans(y_sase1[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+  cr_o <- kmeans(y_oe1[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+  
+  cr_iuase[,j,1] <- cr_i
+  cr_cuase[,j,1] <- cr_c
+  cr_sase[,j,1] <- cr_s
+  cr_oe[,j,1] <- cr_o
+  
+  ri_iuase1[j] <- rand.index(grps, cr_i)
+  ri_cuase1[j] <- rand.index(grps, cr_c)
+  ri_sase1[j] <- rand.index(grps, cr_s)
+  ri_oe1[j] <- rand.index(grps, cr_o)
+}
+
+mri_iuase[1] <- mean(ri_iuase1)
+mri_cuase[1] <- mean(ri_cuase1)
+mri_sase[1] <- mean(ri_sase1)
+mri_oe[1] <- mean(ri_oe1)
+```
+
+```{r, warning=FALSE}
+# analysis on asymptotic performances
+set.seed(321)
+
+for (i in 2:lnsims){
+  nsim <- nsims[i]
+  simulation <- sim_pois(tps, n, nsim*lambda)
+  Ai <- simulation$Ai / nsim
+  Ac <- simulation$Ac / nsim
+  
+  dec_iuase <- decompose(Ai, d)
+  dec_cuase <- decompose(Ac, d)
+  dec_sase <- decompose_sase(Ai, d)
+  dec_oe <- decompose_omnibus(Ai, d)
+  dec_iuasep <- decompose(Ai, d-1)
+  dec_cuasep <- decompose(Ac, d-1)
+  
+  Ah_iuase <- dec_iuase$Ash 
+  Ah_cuase <- dec_cuase$Ash 
+  Ah_sase <- dec_sase$Ash 
+  Ah_oe <- dec_oe$Ash 
+  Ah_iuasep <- dec_iuasep$Ash 
+  Ah_cuasep <- dec_cuasep$Ash 
+  
+  lambda_iuase[,,,i] <- Ah_iuase / ts
+  lambda_cuase[,,,i] <- dif(ts, Ah_cuase) 
+  lambda_crude[,,,i] <- Ai / ts
+  lambda_sase[,,,i] <- Ah_sase / ts
+  lambda_oe[,,,i] <- Ah_oe / ts
+  lambda_iuasep[,,,i] <- Ah_iuasep / ts
+  lambda_cuasep[,,,i] <- dif(ts, Ah_cuasep) 
+  
+  lmse_iuase[i] <- mse(lambda, lambda_iuase[,,,i])
+  lmse_cuase[i] <- mse(lambda, lambda_cuase[,,,i])
+  lmse_crude[i] <- mse(lambda, lambda_crude[,,,i])
+  lmse_sase[i] <- mse(lambda, lambda_sase[,,,i])
+  lmse_oe[i] <- mse(lambda, lambda_oe[,,,i])
+  lmse_iuasep[i] <- mse(lambda, lambda_iuasep[,,,i])
+  lmse_cuasep[i] <- mse(lambda, lambda_cuasep[,,,i])
+  
+  y_iuase <- proc(y, dec_iuase$y)$Yhat
+  y_cuase <- proc(y, t(matrix(dif(ts, dec_cuase$ys), c(d, n*l))))$Yhat
+  x_sase <- dec_sase$xs
+  y_sase <- array(NA, c(d, n, l))
+  for (j in 1:l){
+    p <- proc(t(x), t(x_sase[,,j]))
+    rt <- p$rt
+    dl <- p$dl
+    y_sase[,,j] <- t(rt) %*% dec_sase$ys[,,j] / dl
+  }
+  y_sase <- t(matrix(y_sase, c(d, n*l)))
+  y_oe <- proc(y, t(matrix(dec_oe$ys, c(d, n*l))))$Yhat
+  
+  ymse_iuase[i] <- mse(y, y_iuase)
+  ymse_cuase[i] <- mse(y, y_cuase)
+  ymse_sase[i] <- mse(y, y_sase)
+  ymse_oe[i] <- mse(y, y_oe)
+  
+  ri_iuase <- rep(NA, l)
+  ri_cuase <- rep(NA, l)
+  ri_sase <- rep(NA, l)
+  ri_oe <- rep(NA, l)
+
+  for (j in 1:l){
+    cr_i <- kmeans(y_iuase[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+    cr_c <- kmeans(y_cuase[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+    cr_s <- kmeans(y_sase[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+    cr_o <- kmeans(y_oe[(n*(j-1)+1):(n*j), 1:4], 3)$cluster
+    
+    cr_iuase[,j,i] <- cr_i
+    cr_cuase[,j,i] <- cr_c
+    cr_sase[,j,i] <- cr_s
+    cr_oe[,j,i] <- cr_o
+  
+    ri_iuase[j] <- rand.index(grps, cr_i)
+    ri_cuase[j] <- rand.index(grps, cr_c)
+    ri_sase[j] <- rand.index(grps, cr_s)
+    ri_oe[j] <- rand.index(grps, cr_o)
+  }
+
+  mri_iuase[i] <- mean(ri_iuase)
+  mri_cuase[i] <- mean(ri_cuase)
+  mri_sase[i] <- mean(ri_sase)
+  mri_oe[i] <- mean(ri_oe)
+}
+```
+
+```{r}
+# figure 6
+set.seed(321)
+colors_10 <- c("#9e0142", "#d53e4f", "#f46d43", "#fdae61", "#fee08b", 
+               "#e6f598", "#abdda4", "#66c2a5", "#3288bd", "#5e4fa2")
+nodes_no <- sort(sample(1:n, size=10, replace=FALSE))
+
+for (t in c(1, 10, 25, 50)) {
+  plot(y[(t-1)*n+nodes_no[1], 1], y[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y[(t-1)*n+nodes_no[1], 1], y[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y[(t-1)*n+nodes_no[i], 1], y[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y[(t-1)*n+nodes_no[i], 1], y[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 8
+for (t in c(1, 10, 25, 50)) {
+  plot(y_iuase1[(t-1)*n+nodes_no[1], 1], y_iuase1[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_iuase1[(t-1)*n+nodes_no[1], 1], y_iuase1[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_iuase1[(t-1)*n+nodes_no[i], 1], y_iuase1[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_iuase1[(t-1)*n+nodes_no[i], 1], y_iuase1[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 9
+for (t in c(1, 10, 25, 50)) {
+  plot(y_cuase1[(t-1)*n+nodes_no[1], 1], y_cuase1[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_cuase1[(t-1)*n+nodes_no[1], 1], y_cuase1[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_cuase1[(t-1)*n+nodes_no[i], 1], y_cuase1[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_cuase1[(t-1)*n+nodes_no[i], 1], y_cuase1[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 7
+for (t in c(1, 10, 25, 50)) {
+  plot(y_sase1[(t-1)*n+nodes_no[1], 1], y_sase1[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_sase1[(t-1)*n+nodes_no[1], 1], y_sase1[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_sase1[(t-1)*n+nodes_no[i], 1], y_sase1[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_sase1[(t-1)*n+nodes_no[i], 1], y_sase1[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 10
+for (t in c(1, 10, 25, 50)) {
+  plot(y_oe1[(t-1)*n+nodes_no[1], 1], y_oe1[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_oe1[(t-1)*n+nodes_no[1], 1], y_oe1[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_oe1[(t-1)*n+nodes_no[i], 1], y_oe1[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_oe1[(t-1)*n+nodes_no[i], 1], y_oe1[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 17
+plot(nsims, lmse_oe, col="#9e0142", pch=20, lwd=1, type="l", 
+     xlab="r", ylab="MSE", ylim=c(0, 2), log="x", yaxp=c(0, 2, 2))
+lines(nsims, lmse_sase, col="#E576A2", pch=20, lwd=1)
+lines(nsims, lmse_crude, col="#083D77", pch=20, lwd=1)
+lines(nsims, lmse_cuase, col="#28AcB0", pch=20, lwd=1)
+lines(nsims, lmse_iuase, col="#F4D35E", pch=20, lwd=1)
+legend(x="topright", legend=c("Crude", "SASE", "IUASE", "CUASE", "OE"), 
+       col=c("#083D77", "#E576A2", "#F4D35E", "#28AcB0", "#9e0142"), pch=20)
+```
+
+```{r}
+# figure 16
+set.seed(321)
+p1 <- sample(1:n, 2, replace=TRUE)
+p2 <- sample(1:n, 2, replace=TRUE)
+for (i in 1:lnsims){
+  plot(tps, lambda_oe[p1[1], p1[2],, i], col="#9e0142", pch=20, lwd=1, 
+       type="l", xlab="t", ylab=TeX(r"($\lambda_{50,13}(t)$)"), xlim=c(0, l), ylim=c(5, 35), yaxp=c(5, 35, 3))
+  lines(tps, lambda_sase[p1[1], p1[2],, i], col="#E576A2", pch=20, lwd=1)
+  lines(tps, lambda_crude[p1[1], p1[2],, i], col="#083D77", pch=20, lwd=1)
+  lines(tps, lambda_cuase[p1[1], p1[2],, i], col="#28AcB0", pch=20, lwd=1)
+  lines(tps, lambda_iuase[p1[1], p1[2],, i], col="#F4D35E", pch=20, lwd=1)
+  lines(tps, lambda[p1[1], p1[2],], col="#EE964B", pch=20, lwd=1)
+  legend(x="topright", legend=c("True", "Crude", "SASE", "IUASE", "CUASE", "OE"), 
+       col=c("#EE964B", "#083D77", "#E576A2", "#F4D35E", "#28AcB0", "#9e0142"), pch=20)
+}
+
+for (i in 1:lnsims){
+  plot(tps, lambda_oe[p2[1], p2[2],, i], col="#9e0142", pch=20, lwd=1, 
+       type="l", xlab="t", ylab=TeX(r"($\lambda_{24,16}(t)$)"), xlim=c(0, l), ylim=c(0, 25), yaxp=c(0, 25, 5))
+  lines(tps, lambda_sase[p2[1], p2[2],, i], col="#E576A2", pch=20, lwd=1)
+  lines(tps, lambda_crude[p2[1], p2[2],, i], col="#083D77", pch=20, lwd=1)
+  lines(tps, lambda_cuase[p2[1], p2[2],, i], col="#28AcB0", pch=20, lwd=1)
+  lines(tps, lambda_iuase[p2[1], p2[2],, i], col="#F4D35E", pch=20, lwd=1)
+  lines(tps, lambda[p2[1], p2[2],], col="#EE964B", pch=20, lwd=1)
+  legend(x="topright", legend=c("True", "Crude", "SASE", "IUASE", "CUASE", "OE"), 
+       col=c("#EE964B", "#083D77", "#E576A2", "#F4D35E", "#28AcB0", "#9e0142"), pch=20)
+}
+```
+
+```{r}
+# figure 11
+plot(nsims, ymse_oe, col="#9e0142", pch=20, lwd=1, type="l", 
+     xlab="r", ylab="MSE", ylim=c(0, 6), log="x", yaxp=c(0, 6, 3))
+lines(nsims, ymse_sase, col="#E576A2", pch=20, lwd=1)
+lines(nsims, ymse_cuase, col="#28AcB0", pch=20, lwd=1)
+lines(nsims, ymse_iuase, col="#F4D35E", pch=20, lwd=1)
+legend(x="topright", legend=c("SASE", "IUASE", "CUASE", "OE"), 
+       col=c("#E576A2", "#F4D35E", "#28AcB0", "#9e0142"), pch=20)
+```
+
+```{r}
+# figure 13
+for (t in c(1, 10, 25, 50)) {
+  plot(y_iuase[(t-1)*n+nodes_no[1], 1], y_iuase[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_iuase[(t-1)*n+nodes_no[1], 1], y_iuase[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_iuase[(t-1)*n+nodes_no[i], 1], y_iuase[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_iuase[(t-1)*n+nodes_no[i], 1], y_iuase[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 14
+for (t in c(1, 10, 25, 50)) {
+  plot(y_cuase[(t-1)*n+nodes_no[1], 1], y_cuase[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_cuase[(t-1)*n+nodes_no[1], 1], y_cuase[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_cuase[(t-1)*n+nodes_no[i], 1], y_cuase[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_cuase[(t-1)*n+nodes_no[i], 1], y_cuase[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figue 12
+for (t in c(1, 10, 25, 50)) {
+  plot(y_sase[(t-1)*n+nodes_no[1], 1], y_sase[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_sase[(t-1)*n+nodes_no[1], 1], y_sase[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_sase[(t-1)*n+nodes_no[i], 1], y_sase[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_sase[(t-1)*n+nodes_no[i], 1], y_sase[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 15
+for (t in c(1, 10, 25, 50)) {
+  plot(y_oe[(t-1)*n+nodes_no[1], 1], y_oe[(t-1)*n+nodes_no[1], 2], 
+       cex=3, pch=19, type="p", xlim=c(-1, 11), ylim=c(-1, 11),
+       xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+       col=colors_10[1], xlab="", ylab="")
+  text(y_oe[(t-1)*n+nodes_no[1], 1], y_oe[(t-1)*n+nodes_no[1], 2], 
+       labels=nodes_no[1], col="white", cex=1)
+  for (i in 2:10) {
+    points(y_oe[(t-1)*n+nodes_no[i], 1], y_oe[(t-1)*n+nodes_no[i], 2], 
+           cex=3, pch=19, type="p", col=colors_10[i])
+    text(y_oe[(t-1)*n+nodes_no[i], 1], y_oe[(t-1)*n+nodes_no[i], 2], 
+         labels=nodes_no[i], col="white", cex=1)
+  }
+} 
+```
+
+```{r}
+# figure 22
+plot(nsims, mri_oe, col="#9e0142", pch=20, lwd=1, type="l", 
+     xlab="r", ylab=TeX(r"($_r\bar{R}$)"), 
+     ylim=c(0.7, 1), yaxp=c(0.7, 1, 3), log="x")
+lines(nsims, mri_sase, col="#E576A2", pch=20, lwd=1)
+lines(nsims, mri_cuase, col="#28AcB0", pch=20, lwd=1)
+lines(nsims, mri_iuase, col="#F4D35E", pch=20, lwd=1)
+legend(x="bottomright", legend=c("SASE", "IUASE", "CUASE", "OE"), 
+       col=c("#E576A2", "#F4D35E", "#28AcB0", "#9e0142"), pch=20)
+```
+
+```{r}
+# find time for max and min ri 
+max_ri1 <- which.max(ri_iuase1+ri_cuase1+ri_sase1+ri_oe1)
+min_ri1 <- which.min(ri_iuase1+ri_cuase1+ri_sase1+ri_oe1)
+max_ri <- which.max(ri_iuase+ri_cuase+ri_sase+ri_oe)
+min_ri <- which.min(ri_iuase+ri_cuase+ri_sase+ri_oe)
+```
+
+```{r}
+# figure 20
+colors <- c("#EE8434", "#0F7173", "#C95D63", "#95BF8F", "#717EC3")
+plot(y_sase1[(n*(max_ri1-1)+1):(n*max_ri1), 1], 
+     y_sase1[(n*(max_ri1-1)+1):(n*max_ri1), 2],  
+     xlim=c(4, 26), ylim=c(-11, 26),
+     xaxp=c(5, 25, 4), yaxp=c(-10, 25, 7),
+     col=colors[cr_sase[, max_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+
+plot(y_iuase1[(n*(max_ri1-1)+1):(n*max_ri1), 1], 
+     y_iuase1[(n*(max_ri1-1)+1):(n*max_ri1), 2], 
+     xlim=c(-1, 11), ylim=c(-1, 11),
+     xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+     col=colors[cr_iuase[, max_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+
+plot(y_cuase1[(n*(max_ri1-1)+1):(n*max_ri1), 1], 
+     y_cuase1[(n*(max_ri1-1)+1):(n*max_ri1), 2], 
+     xlim=c(-1, 11), ylim=c(-1, 11),
+     xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+     col=colors[cr_cuase[, max_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+
+plot(y_oe1[(n*(max_ri1-1)+1):(n*max_ri1), 1], 
+     y_oe1[(n*(max_ri1-1)+1):(n*max_ri1), 2],  
+     xlim=c(-1, 11), ylim=c(-1, 11),
+     xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+     col=colors[cr_oe[, max_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+```
+
+```{r}
+# figure 22
+plot(y_sase1[(n*(min_ri1-1)+1):(n*min_ri1), 1], 
+     y_sase1[(n*(min_ri1-1)+1):(n*min_ri1), 2],  
+     xlim=c(-11, 26), ylim=c(-11, 21),
+     xaxp=c(-10, 25, 7), yaxp=c(-10, 20, 6),
+     col=colors[cr_sase[, min_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+
+plot(y_iuase1[(n*(min_ri1-1)+1):(n*min_ri1), 1], 
+     y_iuase1[(n*(min_ri1-1)+1):(n*min_ri1), 2], 
+     xlim=c(-1, 11), ylim=c(-1, 11),
+     xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+     col=colors[cr_iuase[, min_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+
+plot(y_cuase1[(n*(min_ri1-1)+1):(n*min_ri1), 1], 
+     y_cuase1[(n*(min_ri1-1)+1):(n*min_ri1), 2],  
+     xlim=c(-1, 11), ylim=c(-1, 11),
+     xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+     col=colors[cr_cuase[, min_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+
+plot(y_oe1[(n*(min_ri1-1)+1):(n*min_ri1), 1], 
+     y_oe1[(n*(min_ri1-1)+1):(n*min_ri1), 2],  
+     xlim=c(-1, 11), ylim=c(-1, 11),
+     xaxp=c(0, 10, 2), yaxp=c(0, 10, 2),
+     col=colors[cr_oe[, min_ri1, 1]], cex=1, 
+     pch=grps, xlab="", ylab="")
+legend(x="right", legend=1:3, pch=1:3)
+```
+
+
+
+
