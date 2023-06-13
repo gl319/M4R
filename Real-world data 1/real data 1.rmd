@@ -1,0 +1,299 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, echo=FALSE}
+# load needed packages
+library(MASS)
+library(smacof)
+library(cluster)
+library(fossil)
+library(RColorBrewer)
+```
+
+```{r}
+# read all data
+file_names <- paste0(0:95, ".txt")
+
+df_list <- lapply(file_names, function(x) {
+  df_t <- read.table(x, header = FALSE, sep = "\t")   
+  df_t$t <- as.numeric(gsub(".txt", "", x)) + 1  
+  return(df_t)
+})
+
+df <- do.call(rbind, df_list)
+df <- df[, c("t", "V2", "V3")]
+colnames(df) <- c("t", "s", "d")
+```
+
+```{r}
+# re-index
+grps <- strsplit(readLines("grps.txt"), split = ",")
+grps <- lapply(grps, as.integer)
+nodes <- unlist(grps)
+n <- length(nodes)
+assignment <- rep(1:length(grps), times = sapply(grps, length))
+names(nodes) <- 1:n
+df$s <- as.integer(names(nodes)[match(df$s, nodes)])
+df$d <- as.integer(names(nodes)[match(df$d, nodes)])
+```
+
+```{r}
+# time points
+ts <- 1 
+tps <- 1:96
+l <- length(tps) 
+
+# no. of dimensions
+d <- 4 
+```
+
+```{r}
+# IUASE
+decompose <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  A <- matrix(A_arr, n, n*l)
+  udv <- svd(A, nd, nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  ys <- array(t(y), c(nd, n, l))
+  Ah <- x %*% t(y)
+  Ash <- array(Ah, c(n, n, l))
+  list(x=x, y=y, ys=ys, Ash=Ash)
+}
+
+# ASE
+decompose_ase <- function(A, nd){
+  n <- dim(A)[1]
+  udv <- svd(A, nd, nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  Ah <- x %*% t(y)
+  list(x=x, y=y, Ah=Ah)
+}
+
+# SASE
+decompose_sase <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  x <- array(NA, c(n, nd, l))
+  y <- array(NA, c(n, nd, l))
+  Ash <- array(NA, c(n, n, l))
+  for (i in 1:l) {
+    A <- A_arr[,,i]
+    xyi <- decompose_ase(A, nd)
+    x[,,i] <- xyi$x
+    y[,,i] <- xyi$y
+    Ash[,,i] <- xyi$Ah
+  }
+  xs <- aperm(x, c(2, 1, 3))
+  ys <- aperm(y, c(2, 1, 3))
+  list(xs=xs, ys=ys, Ash=Ash)
+}
+
+# OE
+decompose_omnibus <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  A <- matrix(NA, n*l, n*l)
+  for (i in 1:l){
+    for (j in 1:l){
+      A[(n*(i-1)+1):(n*i), (n*(j-1)+1):(n*j)] <- (A_arr[,,i]+A_arr[,,j]) / 2
+    }
+  }
+  udv <- svd(A, nd, nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  xs <- array(t(x), c(nd, n, l))
+  ys <- array(t(y), c(nd, n, l))
+  Ash <- array(NA, c(n, n, l))
+  for (i in 1:l) {
+    Ash[,,i] <- x[((n*(i-1)+1):(n*i)),] %*% 
+      t(y[((n*(i-1)+1):(n*i)),])
+  }
+  list(xs=xs, ys=ys, Ash=Ash)
+}
+
+# approximate derivatives 
+dif <- function(dx, y){
+  d <- dim(y)[1]
+  n <- dim(y)[2]
+  l <- dim(y)[3]
+  yp <- array(NA, c(d, n, l))
+  yp[,,1] <- y[,,1] / dx
+  for (i in 2:l){
+    yp[,,i] <- (y[,,i]-y[,,(i-1)]) / dx
+  }
+  yp
+}
+
+# mean squared errors
+mse <- function(lambdas, lambdahs){
+  mean((lambdas - lambdahs)^2)
+}
+
+# procrustes transformation
+proc <- function(X, Y){
+  p <- Procrustes(X, Y)
+  rt <- p$rotation
+  dl <- p$dilation
+  list(rt=rt, dl=dl, Yhat=dl * Y %*% rt)
+}
+```
+
+```{r}
+# assemble adjacency matrices
+Ais <- array(NA, c(n, n, l))
+Acs <- array(NA, c(n, n, l))
+
+for (t in tps) {
+  df_t <- df[df$t == t, ]
+  At <- matrix(0, n, n)
+  for (i in 1:nrow(df_t)) {
+    At[df_t$s[i], df_t$d[i]] <- At[df_t$s[i], df_t$d[i]] + 1
+  }
+  Ais[,,t] <- At
+  if (t == 1) {Acs[,,t] <- At} else {
+    Acs[,,t] <- Acs[,,t-1] + At
+  }
+}
+```
+
+```{r}
+# decompose to obtain y hat
+dec_iuase1 <- decompose(Ais, d)
+dec_cuase1 <- decompose(Acs, d)
+dec_sase1 <- decompose_sase(Ais, d)
+dec_oe1 <- decompose_omnibus(Ais, d)
+
+x_ref1 <- dec_iuase1$x
+y_ref1 <- dec_iuase1$y
+y_iuase1 <- proc(y_ref1, dec_iuase1$y)$Yhat
+y_cuase1 <- proc(y_ref1, t(matrix(dif(ts, dec_cuase1$ys), c(d, n*l))))$Yhat
+x_sase1 <- dec_sase1$xs
+y_sase1 <- array(NA, c(d, n, l))
+for (j in 1:l){
+  p <- proc(x_ref1, t(x_sase1[,,j]))
+  rt <- p$rt
+  dl <- p$dl
+  y_sase1[,,j] <- t(rt) %*% dec_sase1$ys[,,j] / dl
+}
+y_sase1 <- t(matrix(y_sase1, c(d, n*l)))
+y_oe1 <- proc(y_ref1, t(matrix(dec_oe1$ys, c(d, n*l))))$Yhat
+```
+
+```{r}
+# compute RI
+cr_iuase <- array(NA, c(n, l))
+cr_cuase <- array(NA, c(n, l))
+cr_sase <- array(NA, c(n, l))
+cr_oe <- array(NA, c(n, l))
+
+ri_iuase1 <- rep(NA, l)
+ri_cuase1 <- rep(NA, l)
+ri_sase1 <- rep(NA, l)
+ri_oe1 <- rep(NA, l)
+
+for (j in tps){
+  cr_i <- kmeans(y_iuase1[(n*(j-1)+1):(n*j), 1:4], 23)$cluster
+  cr_c <- kmeans(y_cuase1[(n*(j-1)+1):(n*j), 1:4], 23)$cluster
+  cr_s <- kmeans(y_sase1[(n*(j-1)+1):(n*j), 1:4], 23)$cluster
+  cr_o <- kmeans(y_oe1[(n*(j-1)+1):(n*j), 1:4], 23)$cluster
+  
+  cr_iuase[,j] <- cr_i
+  cr_cuase[,j] <- cr_c
+  cr_sase[,j] <- cr_s
+  cr_oe[,j] <- cr_o
+  
+  ri_iuase1[j] <- rand.index(assignment, cr_i)
+  ri_cuase1[j] <- rand.index(assignment, cr_c)
+  ri_sase1[j] <- rand.index(assignment, cr_s)
+  ri_oe1[j] <- rand.index(assignment, cr_o)
+}
+
+print(summary(ri_sase1))
+print(summary(ri_iuase1))
+print(summary(ri_cuase1))
+print(summary(ri_oe1))
+
+max_ri1 <- which.max(ri_iuase1+ri_cuase1+ri_sase1+ri_oe1)
+min_ri1 <- which.min(ri_iuase1+ri_cuase1+ri_sase1+ri_oe1)
+```
+
+```{r}
+# figure 23 and 24
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_iuase1[(t-1)*n+1:n, 1], y_iuase1[(t-1)*n+1:n, 2],
+       xlim=c(-0.4, -0.2), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.4, -0.2, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[assignment], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_iuase1[(t-1)*n+1:n, 1], y_iuase1[(t-1)*n+1:n, 2],
+       xlim=c(-0.4, -0.2), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.4, -0.2, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[cr_iuase[, t]], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_cuase1[(t-1)*n+1:n, 1], y_cuase1[(t-1)*n+1:n, 2],
+       xlim=c(-0.3, -0.1), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.3, -0.1, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[assignment], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_cuase1[(t-1)*n+1:n, 1], y_cuase1[(t-1)*n+1:n, 2],
+       xlim=c(-0.3, -0.1), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.3, -0.1, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[cr_cuase[, t]], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_sase1[(t-1)*n+1:n, 1], y_sase1[(t-1)*n+1:n, 2],
+       xlim=c(-0.7, -0.5), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.7, -0.5, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[assignment], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_sase1[(t-1)*n+1:n, 1], y_sase1[(t-1)*n+1:n, 2],
+       xlim=c(-0.7, -0.5), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.7, -0.5, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[cr_sase[, t]], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_oe1[(t-1)*n+1:n, 1], y_oe1[(t-1)*n+1:n, 2],
+       xlim=c(-0.4, -0.2), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.4, -0.2, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[assignment], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+
+for (t in c(max_ri1, min_ri1)) {
+  plot(y_oe1[(t-1)*n+1:n, 1], y_oe1[(t-1)*n+1:n, 2],
+       xlim=c(-0.4, -0.2), ylim=c(-0.2, 0.2),
+       xaxp=c(-0.4, -0.2, 2), yaxp=c(-0.2, 0.2, 2),
+       col=rainbow(23)[cr_oe[, t]], cex=1.5, pch=16, type="p",
+       xlab="", ylab="")
+} 
+```
