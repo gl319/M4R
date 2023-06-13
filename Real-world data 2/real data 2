@@ -1,0 +1,245 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r, echo=FALSE}
+# load needed package
+library(MASS)
+library(irlba)
+library(smacof)
+```
+
+```{r}
+# load preprocessed data 1
+df <- readRDS("df5.rds")
+```
+
+```{r}
+# RT computers ids
+rdts <- c("C17693", "C18025", "C19932", "C22409")
+
+# time points
+ts <- 1 
+tps <- 1:4
+l <- length(tps) 
+
+# no. of nodes, dimensions
+n <- 5000
+d <- 4
+```
+
+```{r}
+# IUASE
+decompose <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  A <- matrix(A_arr, n, n*l)
+  udv <- irlba(A, nv = nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  ys <- array(t(y), c(nd, n, l))
+  Ah <- x %*% t(y)
+  Ash <- array(Ah, c(n, n, l))
+  list(x=x, y=y, ys=ys, Ash=Ash)
+}
+
+# ASE
+decompose_ase <- function(A, nd){
+  n <- dim(A)[1]
+  udv <- irlba(A, nv = nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  Ah <- x %*% t(y)
+  list(x=x, y=y, Ah=Ah)
+}
+
+# SASE
+decompose_sase <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  x <- array(NA, c(n, nd, l))
+  y <- array(NA, c(n, nd, l))
+  Ash <- array(NA, c(n, n, l))
+  for (i in 1:l) {
+    A <- A_arr[,,i]
+    xyi <- decompose_ase(A, nd)
+    x[,,i] <- xyi$x
+    y[,,i] <- xyi$y
+    Ash[,,i] <- xyi$Ah
+  }
+  xs <- aperm(x, c(2, 1, 3))
+  ys <- aperm(y, c(2, 1, 3))
+  list(xs=xs, ys=ys, Ash=Ash)
+}
+
+# OE
+decompose_omnibus <- function(A_arr, nd){
+  n <- dim(A_arr)[1]
+  l <- dim(A_arr)[3]
+  A <- matrix(NA, n*l, n*l)
+  for (i in 1:l){
+    for (j in 1:l){
+      A[(n*(i-1)+1):(n*i), (n*(j-1)+1):(n*j)] <- (A_arr[,,i]+A_arr[,,j]) / 2
+    }
+  }
+  udv <- irlba(A, nv = nd)
+  u <- udv$u
+  d <- (udv$d)[1:nd]
+  v <- udv$v
+  x <- u %*% diag(sqrt(d))
+  y <- v %*% diag(sqrt(d))
+  xs <- array(t(x), c(nd, n, l))
+  ys <- array(t(y), c(nd, n, l))
+  Ash <- array(NA, c(n, n, l))
+  for (i in 1:l) {
+    Ash[,,i] <- x[((n*(i-1)+1):(n*i)),] %*% 
+      t(y[((n*(i-1)+1):(n*i)),])
+  }
+  list(xs=xs, ys=ys, Ash=Ash)
+}
+
+# approximate derivatives 
+dif <- function(dx, y){
+  d <- dim(y)[1]
+  n <- dim(y)[2]
+  l <- dim(y)[3]
+  yp <- array(NA, c(d, n, l))
+  yp[,,1] <- y[,,1] / dx
+  for (i in 2:l){
+    yp[,,i] <- (y[,,i]-y[,,(i-1)]) / dx
+  }
+  yp
+}
+
+# mean squared errors
+mse <- function(lambdas, lambdahs){
+  mean((lambdas - lambdahs)^2)
+}
+
+# procrustes transformation
+proc <- function(X, Y){
+  p <- Procrustes(X, Y)
+  rt <- p$rotation
+  dl <- p$dilation
+  list(rt=rt, dl=dl, Yhat=dl * Y %*% rt)
+}
+```
+
+```{r}
+# randomly select 5000 ids and re-index
+uniq1 <- unique(df$d)
+uniq2 <- unique(df$s)
+uniq <- unique(c(uniq1, uniq2))
+uniq <- uniq[!uniq %in% rdts]
+set.seed(123)
+selected1 <- sample(uniq, n-4)
+selected <- c(rdts, selected1)
+names(selected) <- 1:n
+```
+
+```{r}
+# refine data once more
+df1 <- df[df$s %in% selected & df$d %in% selected, ]
+df1$t <- ceiling(df1$t / 3)
+df1$s <- as.integer(names(selected)[match(df1$s, selected)])
+df1$d <- as.integer(names(selected)[match(df1$d, selected)])
+```
+
+```{r}
+# assemble adjacency matrices
+Ais <- array(NA, c(n, n, l))
+Acs <- array(NA, c(n, n, l))
+
+for (t in 1:l) {
+  df_t <- df1[df1$t == t, ]
+  At <- matrix(0, n, n)
+  for (i in 1:nrow(df_t)) {
+    At[df_t$s[i], df_t$d[i]] <- At[df_t$s[i], df_t$d[i]] + 1
+  }
+  Ais[,,t] <- At
+  if (t == 1) {Acs[,,t] <- At} else {
+    Acs[,,t] <- Acs[,,t-1] + At
+  }
+}
+```
+
+```{r}
+# figure 26
+dec_iuase1 <- decompose(Ais, d)
+x_ref1 <- dec_iuase1$x
+y_ref1 <- dec_iuase1$y
+y_iuase1 <- dec_iuase1$y
+
+for (t in tps) {
+  plot(y_iuase1[(t-1)*n+1:n, 1], y_iuase1[(t-1)*n+1:n, 2],
+       xlim=c(0, 6e-04), ylim=c(0, 1e-02),
+       xaxp=c(0, 6e-04, 2), yaxp=c(0, 1e-02, 2),
+       col="#abdda4", cex=1, pch=16, type="p", xlab="", ylab="")
+  points(y_iuase1[(t-1)*n+(1:4), 1], y_iuase1[(t-1)*n+(1:4), 2], 
+       col="#d53e4f", cex=1.5, pch=2:5, lwd=2)
+  legend(x="bottomright", legend=1:4, pch=2:5, col="#d53e4f")
+} 
+```
+
+```{r}
+# figure 27
+dec_cuase1 <- decompose(Acs, d)
+y_cuase1 <- proc(y_ref1, t(matrix(dif(ts, dec_cuase1$ys), c(d, n*l))))$Yhat
+
+for (t in tps) {
+  plot(y_cuase1[(t-1)*n+1:n, 1], y_cuase1[(t-1)*n+1:n, 2],
+       xlim=c(0, 6e-04), ylim=c(0, 1e-02),
+       xaxp=c(0, 6e-04, 2), yaxp=c(0, 1e-02, 2),
+       col="#abdda4", cex=1, pch=16, type="p", xlab="", ylab="")
+  points(y_cuase1[(t-1)*n+(1:4), 1], y_cuase1[(t-1)*n+(1:4), 2], 
+       col="#d53e4f", cex=1.5, pch=2:5, lwd=2)
+  legend(x="bottomright", legend=1:4, pch=2:5, col="#d53e4f")
+} 
+```
+
+```{r}
+# figure 25
+dec_sase1 <- decompose_sase(Ais, d)
+x_sase1 <- dec_sase1$xs
+y_sase1 <- array(NA, c(d, n, l))
+for (j in 1:l){
+  p <- proc(x_ref1, t(x_sase1[,,j]))
+  rt <- p$rt
+  dl <- p$dl
+  y_sase1[,,j] <- t(rt) %*% dec_sase1$ys[,,j] / dl
+}
+y_sase1 <- t(matrix(y_sase1, c(d, n*l)))
+
+for (t in tps) {
+  plot(y_sase1[(t-1)*n+1:n, 1], y_sase1[(t-1)*n+1:n, 2],
+       xlim=c(0, 6e-04), ylim=c(0, 1e-02),
+       xaxp=c(0, 6e-04, 2), yaxp=c(0, 1e-02, 2),
+       col="#abdda4", cex=1, pch=16, type="p", xlab="", ylab="")
+  points(y_sase1[(t-1)*n+(1:4), 1], y_sase1[(t-1)*n+(1:4), 2], 
+       col="#d53e4f", cex=1.5, pch=2:5, lwd=2)
+  legend(x="bottomright", legend=1:4, pch=2:5, col="#d53e4f")
+} 
+```
+
+```{r}
+# figure 28
+dec_oe1 <- decompose_omnibus(Ais, d)
+y_oe1 <- proc(y_ref1, t(matrix(dec_oe1$ys, c(d, n*l))))$Yhat
+
+for (t in tps) {
+  plot(y_oe1[(t-1)*n+1:n, 1], y_oe1[(t-1)*n+1:n, 2],
+       xlim=c(0, 6e-04), ylim=c(0, 1e-02),
+       xaxp=c(0, 6e-04, 2), yaxp=c(0, 1e-02, 2),
+       col="#abdda4", cex=1, pch=16, type="p", xlab="", ylab="")
+  points(y_oe1[(t-1)*n+(1:4), 1], y_oe1[(t-1)*n+(1:4), 2], 
+       col="#d53e4f", cex=1.5, pch=2:5, lwd=2)
+  legend(x="bottomright", legend=1:4, pch=2:5, col="#d53e4f")
+} 
+```
