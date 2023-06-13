@@ -11,7 +11,7 @@ library(smacof)
 ```
 
 ```{r}
-# load preprocessed data 1
+# load preprocessed data 
 df <- readRDS("df5.rds")
 ```
 
